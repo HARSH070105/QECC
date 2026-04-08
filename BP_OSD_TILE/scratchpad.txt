@@ -1,0 +1,24 @@
+def build_matrices(self):
+        # Create a list of starting positions jumping by B (e.g., [0, 3, 6] for L=10, B=3)
+        valid_positions = list(range(0, self.L - self.B + 1, self.B))
+        
+        # Calculate the new number of stabilizers based on the non-overlapping grid
+        num_stabs = len(valid_positions) ** 2
+        
+        hx = np.zeros((num_stabs, self.num_edges), dtype=int)
+        hz = np.zeros((num_stabs, self.num_edges), dtype=int)
+        
+        row = 0
+        for dy in valid_positions:
+            for dx in valid_positions:
+                # Place X-tile
+                for e_type, x, y in self.x_tile:
+                    hx[row, self._edge_to_idx(e_type, x + dx, y + dy)] = 1
+                
+                # Place Z-tile
+                for e_type, x, y in self.z_tile:
+                    hz[row, self._edge_to_idx(e_type, x + dx, y + dy)] = 1
+                
+                row += 1
+                
+        return hx, hz
