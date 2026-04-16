@@ -5,16 +5,13 @@ from itertools import combinations
 from concurrent.futures import ProcessPoolExecutor
 from scipy import sparse
 
-# Import your matrices (assumed to be sparse NPZ loads as per previous turns)
 from gb_254_28 import HX as HX_A1, HZ as HZ_A1
 from ghgp_882_24 import HX as HX_B1, HZ as HZ_B1
 from hgp_7938_578 import HX as HX_C1, HZ as HZ_C1
 
-# Configuration matching paper [cite: 357, 358]
-p_list = np.linspace(0.01, 0.12, 8)
-num_trials = 100
+p_list = np.linspace(0.05, 0.1, 6)
 max_iter = 32
-osd_order = 0 
+osd_order = 0
 nms_factor = 0.625  # Normalized Min-Sum factor 
 
 def generate_pauli_error(n, p):
@@ -30,19 +27,28 @@ def generate_pauli_error(n, p):
 
 class BPDecoder:
     def __init__(self, H, p, max_iter=32, nms_factor=0.625):
-        # Ensure H is CSR for efficient row slicing
+        # Keep H as CSR for fast row operations
         self.H = H.tocsr() if sparse.issparse(H) else sparse.csr_matrix(H)
         self.m, self.n = self.H.shape
         self.max_iter = max_iter
         self.p = p
         self.nms_factor = nms_factor
         
-        # Pre-calculate neighbors for speed [cite: 141, 142]
-        self.check_to_var = [self.H.getrow(i).indices for i in range(self.m)]
-        self.var_to_check = [self.H.getcol(j).indices for j in range(self.n)]
+        # Convert to CSC for fast column operations
+        H_csc = self.H.tocsc()
+
+        # Pre-calculate neighbors properly using indptr and indices
+        self.check_to_var = [
+            self.H.indices[self.H.indptr[i]:self.H.indptr[i+1]] 
+            for i in range(self.m)
+        ]
+        self.var_to_check = [
+            H_csc.indices[H_csc.indptr[j]:H_csc.indptr[j+1]] 
+            for j in range(self.n)
+        ]
 
     def decode(self, syndrome):
-        p_eff = 2 * self.p / 3 # [cite: 251, 307]
+        p_eff = 2 * self.p / 3 
         llr = np.full(self.n, np.log((1 - p_eff) / p_eff))
         msg_vc = np.zeros((self.m, self.n))
         msg_cv = np.zeros((self.m, self.n))
@@ -82,7 +88,7 @@ class BPDecoder:
         return (posterior < 0).astype(np.uint8), posterior
 
 def gf2_solve(H, s):
-    # Gaussian elimination over GF(2) [cite: 215]
+    # Gaussian elimination over GF(2)
     H, s = H.copy(), s.copy()
     m, n = H.shape
     pivots, row = [], 0
@@ -103,7 +109,7 @@ def gf2_solve(H, s):
 def osd_decode(H, syndrome, llr, order):
     n = H.shape[1]
     perm = np.argsort(np.abs(llr))
-    # Standard OSD uses a dense solver on the reliable basis [cite: 212, 214]
+    
     Hs = H.toarray()[:, perm] if sparse.issparse(H) else H[:, perm]
     pivots, s_red = gf2_solve(Hs, syndrome)
     
@@ -117,7 +123,7 @@ def osd_decode(H, syndrome, llr, order):
             for i, col in enumerate(pivots):
                 if i < len(s_tmp): e[col] = s_tmp[i]
             
-            # The paper selects recovery operator with minimum weight [cite: 43]
+            # The paper selects recovery operator with minimum weight
             weight = np.sum(e)
             if weight < min_w:
                 min_w, best = weight, e.copy()
@@ -130,7 +136,7 @@ def run_single_trial(args):
     HX, HZ, p, osd_order = args
     X_err, Z_err = generate_pauli_error(HX.shape[1], p)
     
-    # Decode Z-type errors using HX [cite: 310, 311]
+    # Decode Z-type errors using HX
     sX = (HX @ Z_err) % 2
     bpZ = BPDecoder(HX, p, max_iter, nms_factor)
     z_hat, llr_z = bpZ.decode(sX)
@@ -147,27 +153,68 @@ def run_single_trial(args):
     if osd_order != -1 and not np.all((HZ @ x_hat) % 2 == sZ):
         x_hat = osd_decode(HZ, sZ, llr_x, osd_order)
 
-    resZ, resX = Z_err ^ z_hat, X_err ^ x_hat
-    return np.all((HX @ resZ) % 2 == 0) and np.all((HZ @ resX) % 2 == 0)
+    # Calculate residual errors
+    resZ = Z_err ^ z_hat
+    resX = X_err ^ x_hat
+    
+    success_Z = np.all((HX @ resZ) % 2 == 0)
+    success_X = np.all((HZ @ resX) % 2 == 0)
+    
+    return success_Z and success_X
 
-def simulate_parallel(HX, HZ, osd_order):
+def simulate_parallel(HX, HZ, osd_order, target_errors=25, max_trials=10000000):
     results = []
+    # Batch size controls how many trials are sent to the CPU pool at once.
+    # Increase this if you have a lot of CPU cores to reduce overhead.
+    batch_size = 1000 
+    
     for p in p_list:
+        errors = 0
+        trials = 0
+        
         with ProcessPoolExecutor() as executor:
-            args = [(HX, HZ, p, osd_order) for _ in range(num_trials)]
-            trial_results = list(tqdm(executor.map(run_single_trial, args), total=num_trials, desc=f"p={p:.3f}"))
-            results.append(1.0 - np.mean(trial_results))
+            # Progress bar tracks the number of errors found, not total trials
+            with tqdm(total=target_errors, desc=f"p={p:.3f}") as pbar:
+                while errors < target_errors and trials < max_trials:
+                    args = [(HX, HZ, p, osd_order) for _ in range(batch_size)]
+                    
+                    # map returns True for a success, False for an error
+                    trial_results = list(executor.map(run_single_trial, args))
+                    
+                    trials += batch_size
+                    new_errors = batch_size - sum(trial_results)
+                    errors += new_errors
+                    
+                    pbar.update(new_errors)
+                    pbar.set_postfix({'Trials': trials, 'WER': f"{errors/trials:.2e}"})
+        
+        wer = errors / trials
+        # Prevent log(0) plotting errors if it perfectly corrects everything up to max_trials
+        if wer == 0:
+            wer = 1 / max_trials 
+            
+        results.append(wer)
+        
     return np.array(results)
 
 # Main Execution
 if __name__ == "__main__":
-    codes = {"A1 (GB)": (HX_A1, HZ_A1), "B1 (GHP)": (HX_B1, HZ_B1)}
+    codes = {"A1 (GB)": (HX_A1, HZ_A1), 
+            "B1 (GHP)": (HX_B1, HZ_B1),
+            #  "C1 (HGP)": (HX_C1, HZ_C1)
+             }
+    
+    w_order = 0  # OSD order parameter
     
     plt.figure(figsize=(7,6))
     for name, (HX, HZ) in codes.items():
         print(f"\nSimulating {name}...")
+        
+        print("Running BP only...")
         res_bp = simulate_parallel(HX, HZ, osd_order=-1)
-        res_osd = simulate_parallel(HX, HZ, osd_order=0)
+        
+        print(f"Running BP + OSD order {w_order}...")
+        res_osd = simulate_parallel(HX, HZ, osd_order=w_order)
         
         plt.semilogy(p_list, res_bp, 'o-', label=f"{name}, BP")
         plt.semilogy(p_list, res_osd, 'o--', label=f"{name}, BP+OSD")
@@ -176,4 +223,4 @@ if __name__ == "__main__":
     plt.ylabel("WER")
     plt.legend()
     plt.grid(True, which="both", linestyle="--")
-    plt.show()
+    plt.savefig("decoder_performance_on_GB_GHP.png", dpi=300)
